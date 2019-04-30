@@ -1,7 +1,11 @@
+import json
+
 from flask import Blueprint, request, jsonify
 from sqlalchemy import func
+from db import db
 
 from main.models.queries import QueryModel
+from main.libs.file import write_json_file
 
 cache = Blueprint('cache', __name__)
 
@@ -23,7 +27,7 @@ def get_cached_queries():
     # Check required fields
     for field in REQUIRED_FIELDS:
         if params.get(field) is None:
-            return jsonify({'message': '{} is a required field'.format(field)}, 200)
+            return jsonify({'message': '{} is a required field'.format(field)}), 400
 
     latitude = params['latitude']
     longitude = params['longitude']
@@ -35,25 +39,6 @@ def get_cached_queries():
                                               * func.cos(func.radians(QueryModel.longitude)
                                                          - (func.radians(longitude))))
                                     * 6371 <= DISTANCE_LIMIT)
-    # query = QueryModel.query.filter(
-    #     func.asin(func.sqrt(0.5 - func.cos(func.radians(latitude) - func.radians(QueryModel.latitude)) / 2
-    #                         + func.cos(func.radians(QueryModel.latitude))
-    #                         * func.cos(func.radians(latitude))
-    #                         * (1 - func.cos(func.radians(longitude - QueryModel.longitude))) / 2)
-    #               ) * 12742 <= DISTANCE_LIMIT)
-
-    # query = QueryModel.query.filter(
-    #     6373 * 2 *
-    #     func.atan2(func.sqrt(func.sin((func.radians(latitude) - func.radians(QueryModel.latitude)) / 2) ** 2
-    #                          + func.cos(func.radians(QueryModel.latitude)) * func.cos(func.radians(latitude))
-    #                          * func.sin((func.radians(longitude) - func.radians(QueryModel.longitude)) / 2) ** 2),
-    #                func.sqrt(1 - (func.sin((func.radians(latitude) - func.radians(QueryModel.latitude)) / 2) ** 2
-    #                               + func.cos(func.radians(QueryModel.latitude))
-    #                               * func.cos(func.radians(latitude))
-    #                               * func.sin((func.radians(longitude) - func.radians(QueryModel.longitude)) / 2) ** 2)
-    #                          )
-    #                )
-    # )
 
     categories = params.get('categories')
     if categories:
@@ -61,16 +46,32 @@ def get_cached_queries():
 
     results = query.all()
 
-    # result_categories = set([item.category for item in results if item is not None])
-    # missed_categories = [category for category in categories if category not in result_categories]
-
-    # names = params.get('names')
-    # if names:
-    #     results = [result for result in results if ]
-
     return jsonify({
         'results': results,
     })
+
+
+@cache.route('/queries', methods=['POST'])
+def store_query_to_cache():
+    data = json.loads(request.data)
+    # Check required fields
+    for field in REQUIRED_FIELDS:
+        if data.get(field) is None:
+            return jsonify({'message': '{} is a required field'.format(field)}), 400
+
+    results = data.get('results')
+    if not results:
+        return jsonify({'message': 'results is required'}), 400
+
+    latitude = data['latitude']
+    longitude = data['longitude']
+
+    result_path = write_json_file(results)
+
+    query = QueryModel(latitude=latitude, longitude=longitude, result_path=result_path)
+    db.session.add(query)
+    db.session.commit()
+    return jsonify({}), 201
 
 
 def compute_response_type(results):

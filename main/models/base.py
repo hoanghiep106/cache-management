@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from main.db import db
+from db import db
 
 
 class TimestampMixin(object):

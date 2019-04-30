@@ -1,4 +1,4 @@
-from main.db import db
+from db import db
 from main.models.base import TimestampMixin
 
 
