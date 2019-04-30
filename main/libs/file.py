@@ -14,3 +14,9 @@ def write_json_file(data):
     with open(file_path, 'w') as outfile:
         json.dump(data, outfile)
     return file_path
+
+
+def read_json_file(path):
+    with open(path) as json_file:
+        data = json.load(json_file)
+    return data

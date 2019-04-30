@@ -5,14 +5,14 @@ from sqlalchemy import func
 from db import db
 
 from main.models.queries import QueryModel
-from main.libs.file import write_json_file
+from main.libs.file import write_json_file, read_json_file
 
 cache = Blueprint('cache', __name__)
 
 REQUIRED_FIELDS = ['latitude', 'longitude']
 
 # km unit
-DISTANCE_LIMIT = 0.5
+DISTANCE_LIMIT = 5
 
 
 class ResponseType:
@@ -44,7 +44,13 @@ def get_cached_queries():
     if categories:
         query.filter(QueryModel.category.in_(categories))
 
-    results = query.all()
+    cached_queries = query.all()
+
+    # Extract results from data file
+    results = []
+    for cached_query in cached_queries:
+        data = read_json_file(cached_query.result_path)
+        results += data
 
     return jsonify({
         'results': results,
@@ -66,17 +72,10 @@ def store_query_to_cache():
     latitude = data['latitude']
     longitude = data['longitude']
 
+    # Write results to file to reduce cache size
     result_path = write_json_file(results)
 
     query = QueryModel(latitude=latitude, longitude=longitude, result_path=result_path)
     db.session.add(query)
     db.session.commit()
     return jsonify({}), 201
-
-
-def compute_response_type(results):
-    return ResponseType.MISSED
-
-
-def get_cache(latitude, longitude, types, names):
-    return []
