@@ -1,24 +1,20 @@
 import json
+from datetime import datetime
 
 from flask import Blueprint, request, jsonify
-from sqlalchemy import func
+from sqlalchemy import func, and_
 from db import db
 
-from main.models.queries import QueryModel
-from main.libs.file import write_json_file, read_json_file
+from main.models.entry import EntryModel
+from main.models.result import ResultModel
+from main.engines import entry_result
+from main.libs.identifier import generate_id
 
 cache = Blueprint('cache', __name__)
 
-REQUIRED_FIELDS = ['latitude', 'longitude']
+REQUIRED_FIELDS = ['latitude', 'longitude', 'radius']
 
-# km unit
-DISTANCE_LIMIT = 5
-
-
-class ResponseType:
-    FULLY_HIT = 'fully_hit'
-    PARTIALLY_HIT = 'partially_hit'
-    MISSED = 'missed'
+MAIN_CATEGORIES = ['food', 'drinks', 'art']
 
 
 @cache.route('/queries', methods=['GET'])
@@ -28,38 +24,77 @@ def get_cached_queries():
     for field in REQUIRED_FIELDS:
         if params.get(field) is None:
             return jsonify({'message': '{} is a required field'.format(field)}), 400
+    page = params.get('page') or 1
 
-    latitude = params['latitude']
-    longitude = params['longitude']
+    hashed_id = generate_id(params, ['latitude', 'longitude', 'radius', 'categories'])
+    print(hashed_id)
+    query = EntryModel.query.get(hashed_id)
+
+    if query is not None:
+        results = entry_result.get_entry_results(hashed_id, page)
+        total_pages = entry_result.get_entry_total_pages(hashed_id)
+        return jsonify({
+            'results': results,
+            'page': page,
+            'total_pages': total_pages
+        })
+    print('query existed')
+    latitude = params.get('latitude') and float(params.get('latitude'))
+    longitude = params.get('longitude') and float(params.get('longitude'))
+    radius = params.get('radius') and float(params.get('radius'))
+
     # Add location to the query
-    query = QueryModel.query.filter(func.acos(func.sin(func.radians(latitude)) *
-                                              func.sin(func.radians(QueryModel.latitude))
-                                              + func.cos(func.radians(latitude)) *
-                                              func.cos(func.radians(QueryModel.latitude))
-                                              * func.cos(func.radians(QueryModel.longitude)
-                                                         - (func.radians(longitude))))
-                                    * 6371 <= DISTANCE_LIMIT)
+    related_queries = EntryModel.query.filter(and_(
+        func.asin(func.sqrt(0.5 - func.cos(func.radians(latitude) - func.radians(EntryModel.latitude)) / 2
+                            + func.cos(func.radians(EntryModel.latitude))
+                            * func.cos(func.radians(latitude))
+                            * (1 - func.cos(func.radians(longitude - EntryModel.longitude))) / 2)
+                  ) * 12742 <= 0.2 * radius,
+        func.abs(radius - EntryModel.radius) <= 0.2 * radius
+    )).all()
 
-    categories = params.get('categories')
-    if categories:
-        query.filter(QueryModel.category.in_(categories))
+    if len(related_queries) > 0:
+        categories = params.get('categories')
+        print(categories)
+        if categories:
+            # The list of related queries is expected to be so small that a loop doesn't affect the performance much
+            for query in related_queries:
+                # This means the 2 queries should have the same results
+                print(query.categories, categories)
+                if query.categories == categories:
+                    first_page_results, total_pages = copy_entry(query.id, hashed_id, latitude,
+                                                                 longitude, radius, categories)
+                    return jsonify({
+                        'results': first_page_results,
+                        'page': 1,
+                        'total_pages': total_pages
+                    })
+        no_category_queries = [query for query in related_queries if not query.categories]
+        if len(no_category_queries) > 0:
+            print('None, None')
+            first_page_results, total_pages = copy_entry(no_category_queries[0].id, hashed_id, latitude,
+                                                         longitude, radius, categories)
+            return jsonify({
+                'results': first_page_results,
+                'page': 1,
+                'total_pages': total_pages
+            })
+        # main_category_queries = [query for query in related_queries
+        #                          if len([category for category in MAIN_CATEGORIES
+        #                                  if category in query.categories
+        #                                  ]) > 0]
+        # if main_category_queries > 1:
+        #     # Merge the queries and return
+        #     merged_results = []
+        #     for query in main_category_queries:
 
-    cached_queries = query.all()
 
-    # Extract results from data file
-    results = []
-    for cached_query in cached_queries:
-        data = read_json_file(cached_query.result_path)
-        results += data
-
-    return jsonify({
-        'results': results,
-    })
+    return jsonify({}), 404
 
 
 @cache.route('/queries', methods=['POST'])
 def store_query_to_cache():
-    data = json.loads(request.data)
+    data = json.loads(request.json)
     # Check required fields
     for field in REQUIRED_FIELDS:
         if data.get(field) is None:
@@ -67,15 +102,64 @@ def store_query_to_cache():
 
     results = data.get('results')
     if not results:
-        return jsonify({'message': 'results is required'}), 400
+        return jsonify({'message': 'results field is required'}), 400
 
+    categories = data.get('categories')
     latitude = data['latitude']
     longitude = data['longitude']
+    radius = data['radius']
 
-    # Write results to file to reduce cache size
-    result_path = write_json_file(results)
+    hashed_id = generate_id({
+        'latitude': latitude,
+        'longitude': longitude,
+        'radius': radius,
+        'categories': categories,
+    }, ['latitude', 'longitude', 'radius', 'categories'])
 
-    query = QueryModel(latitude=latitude, longitude=longitude, result_path=result_path)
-    db.session.add(query)
+    query = EntryModel.query.get(hashed_id)
+    if query is not None:
+        now = datetime.utcnow()
+        if (now - query.updated).days > 7:
+            entry_result.clear_entry_results(hashed_id)
+            # Write results to file to reduce cache size
+            entry_result.store_entry_results(hashed_id, results)
+            query.updated = now
+            db.session.commit()
+    else:
+        query = EntryModel(id=hashed_id,
+                           latitude=latitude,
+                           longitude=longitude,
+                           radius=radius,
+                           categories=categories)
+        db.session.add(query)
+        db.session.commit()
+
+        # Write results to file to reduce cache size
+        entry_result.store_entry_results(hashed_id, results)
+
+    return jsonify({
+        'results': entry_result.get_entry_results(hashed_id, 1),
+        'page': 1,
+        'total_pages': entry_result.get_entry_total_pages(hashed_id)
+    }), 201
+
+
+def copy_entry(existed_entry_id, entry_id, latitude, longitude, radius, categories):
+    # Create a new query, so the later requests can be access fast
+    new_query = EntryModel(id=entry_id,
+                           latitude=latitude,
+                           longitude=longitude,
+                           radius=radius,
+                           categories=categories)
+    db.session.add(new_query)
     db.session.commit()
-    return jsonify({}), 201
+    # Create references to page results
+    for page_result in ResultModel.query.filter(ResultModel.entry_id == existed_entry_id).all():
+        new_page_result = ResultModel(entry_id=new_query.id, data_path=page_result.data_path,
+                                      page=page_result.page)
+        db.session.add(new_page_result)
+    db.session.commit()
+
+    first_page_results = entry_result.get_entry_results(new_query.id, 1)
+    total_pages = entry_result.get_entry_total_pages(new_query.id)
+    return first_page_results, total_pages
