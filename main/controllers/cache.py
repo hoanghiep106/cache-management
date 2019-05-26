@@ -26,11 +26,11 @@ def get_cached_queries():
             return jsonify({'message': '{} is a required field'.format(field)}), 400
     page = params.get('page') or 1
 
+    # Generate hashed value and check in the cache
     hashed_id = generate_id(params, ['latitude', 'longitude', 'radius', 'categories'])
-    print(hashed_id)
     query = EntryModel.query.get(hashed_id)
-
     if query is not None:
+        print('query existed')
         results = entry_result.get_entry_results(hashed_id, page)
         total_pages = entry_result.get_entry_total_pages(hashed_id)
         return jsonify({
@@ -38,12 +38,11 @@ def get_cached_queries():
             'page': page,
             'total_pages': total_pages
         })
-    print('query existed')
     latitude = params.get('latitude') and float(params.get('latitude'))
     longitude = params.get('longitude') and float(params.get('longitude'))
     radius = params.get('radius') and float(params.get('radius'))
 
-    # Add location to the query
+    # Add location to the query according to the formula in Appendix B
     related_queries = EntryModel.query.filter(and_(
         func.asin(func.sqrt(0.5 - func.cos(func.radians(latitude) - func.radians(EntryModel.latitude)) / 2
                             + func.cos(func.radians(EntryModel.latitude))
@@ -55,13 +54,12 @@ def get_cached_queries():
 
     if len(related_queries) > 0:
         categories = params.get('categories')
-        print(categories)
         if categories:
             # The list of related queries is expected to be so small that a loop doesn't affect the performance much
             for query in related_queries:
-                # This means the 2 queries should have the same results
-                print(query.categories, categories)
+                print('Create references')
                 if query.categories == categories:
+                    # This means the 2 queries should have the same results
                     first_page_results, total_pages = copy_entry(query.id, hashed_id, latitude,
                                                                  longitude, radius, categories)
                     return jsonify({
@@ -71,7 +69,8 @@ def get_cached_queries():
                     })
         no_category_queries = [query for query in related_queries if not query.categories]
         if len(no_category_queries) > 0:
-            print('None, None')
+            print('Created references')
+            # This means the 2 queries should have the same results
             first_page_results, total_pages = copy_entry(no_category_queries[0].id, hashed_id, latitude,
                                                          longitude, radius, categories)
             return jsonify({
@@ -79,15 +78,25 @@ def get_cached_queries():
                 'page': 1,
                 'total_pages': total_pages
             })
-        # main_category_queries = [query for query in related_queries
-        #                          if len([category for category in MAIN_CATEGORIES
-        #                                  if category in query.categories
-        #                                  ]) > 0]
-        # if main_category_queries > 1:
-        #     # Merge the queries and return
-        #     merged_results = []
-        #     for query in main_category_queries:
-
+        main_category_queries = [query for query in related_queries
+                                 if len([category for category in MAIN_CATEGORIES
+                                         if category in query.categories
+                                         ]) > 0]
+        if len(main_category_queries) > 1:
+            # Merge the queries and return
+            merged_results = []
+            for query in main_category_queries:
+                query_results = ResultModel.query.filter_by(entry_id=query.id).all()
+                for result in query_results:
+                    merged_results += entry_result.get_entry_results(query.id, result.page)
+            new_query = EntryModel(id=hashed_id,
+                                   latitude=latitude,
+                                   longitude=longitude,
+                                   radius=radius,
+                                   categories=categories)
+            db.session.add(new_query)
+            db.session.commit()
+            entry_result.store_entry_results(hashed_id, merged_results)
 
     return jsonify({}), 404
 
